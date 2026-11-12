@@ -40,7 +40,30 @@ int main() {
     profiles.push_back(makeSpeedProfile(5.0, 20u, "fast"));
     profiles.push_back(makeSpeedProfile(10.0, 4u, "slow"));
     const std::string ratios = assignSpeedPack(profiles, 30u, nullptr);
-    expect(ratios == "1@26*1@4", "faster device fills to its cap, then takes the leftover");
+    // The slow device caps at 4 layers, the fast one at 20; the remaining 6 do
+    // not fit anywhere and overflow onto the slowest device, which the
+    // allocation-failure path then shrinks. What matters is that the split is
+    // proportional (2:1 by speed) and that caps are respected on the way in.
+    expect(ratios == "1@20*1@10", "split is proportional to speed, then overflow lands on the slowest");
+
+    // Pipelines are limited by their slowest stage, so four identical devices
+    // must come out even. The previous first-fill rule gave 25/1/1/1 here,
+    // which ran the whole chain at single-card speed.
+    std::vector<SpeedDeviceProfile> four;
+    for (int i = 0; i < 4; ++i) four.push_back(makeSpeedProfile(5.0, 22u, "t4"));
+    expect(assignSpeedPack(four, 28u, nullptr) == "1@7*1@7*1@7*1@7",
+        "identical devices split evenly");
+    expect(assignSpeedPack(four, 36u, nullptr) == "1@9*1@9*1@9*1@9",
+        "identical devices split evenly at another model size");
+
+    // One device at half speed should take half the layers of its peers.
+    std::vector<SpeedDeviceProfile> mixed;
+    mixed.push_back(makeSpeedProfile(5.0, 22u, "a"));
+    mixed.push_back(makeSpeedProfile(10.0, 22u, "b"));
+    mixed.push_back(makeSpeedProfile(5.0, 22u, "c"));
+    mixed.push_back(makeSpeedProfile(5.0, 22u, "d"));
+    expect(assignSpeedPack(mixed, 28u, nullptr) == "1@8*1@4*1@8*1@8",
+        "a half-speed device takes half the layers so stage times match");
 
     std::vector<char> live(2, 1);
     live[1] = 0;

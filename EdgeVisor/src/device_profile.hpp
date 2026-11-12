@@ -88,9 +88,32 @@ inline double estimateLayerWeightBytes(const ModelShape &shape) {
     return (double)params * bytesPerWeight;
 }
 
+// Test hook: pretend a device has this much free memory, whatever cudaMemGetInfo
+// reports. Edge deployments are memory-constrained in ways a lab T4 is not, and
+// the only honest way to study the shadow budget under that constraint is to
+// vary it directly instead of hoping a bigger model happens to fit worse.
+// 0 means "use the measured value".
+inline unsigned long long &freeBytesOverride() {
+    static unsigned long long value = 0ull;
+    return value;
+}
+
+// Share of free memory the planner is allowed to spend. Defaults to 0.70, the
+// same figure the caps have always used.
+inline double &memoryBudgetFraction() {
+    static double value = 0.70;
+    return value;
+}
+
+inline unsigned long long effectiveFreeBytes(unsigned long long measured) {
+    const unsigned long long overrideValue = freeBytesOverride();
+    return overrideValue > 0ull ? overrideValue : measured;
+}
+
 inline unsigned capFromLayerBytes(unsigned long long freeBytes, double perLayer, unsigned nLayers) {
     if (perLayer < 1.0) return nLayers == 0u ? 8u : nLayers;
-    const double budget = (double)freeBytes * 0.70;
+    const double fraction = memoryBudgetFraction();
+    const double budget = (double)effectiveFreeBytes(freeBytes) * fraction;
     if (budget <= perLayer) return 1u;
     unsigned cap = (unsigned)((budget - perLayer) / perLayer);
     if (cap < 1u) cap = 1u;
@@ -117,8 +140,21 @@ inline unsigned estimateResidentLayerCap(unsigned long long freeBytes, const Mod
     return capFromLayerBytes(freeBytes, perLayer, shape.nLayers);
 }
 
-// Preserve pipeline order. Faster devices fill first, up to cap.
-// Leftover layers stay on the fastest device, matching the lab speed-pack.
+// Distribute layers so the pipeline is balanced, not so the fastest device
+// gets the most.
+//
+// A pipeline's token rate is set by its slowest stage. Stage time is
+// layers * msPerLayer, so throughput is maximised by making those products
+// equal, subject to each device's memory cap. Filling the fastest device first
+// is right for replica serving, where a faster replica should absorb more
+// requests, but in a pipeline it only moves the bottleneck: with four identical
+// T4s it produced 25/1/1/1, which runs at the speed of a single card.
+//
+// Assignment is proportional: device i gets layers proportional to 1/ms_i, so
+// layers_i * ms_i is the same everywhere. Devices whose share exceeds their cap
+// are pinned at the cap and dropped from the pool, and the remaining layers are
+// re-split among the rest. If every device hits its cap there is no balanced
+// solution; the surplus goes to the slowest device, where it costs least.
 inline std::string assignSpeedPack(
     const std::vector<SpeedDeviceProfile> &profiles,
     unsigned nLayers,
@@ -129,32 +165,81 @@ inline std::string assignSpeedPack(
         return liveNodes == nullptr || node >= liveNodes->size() || (*liveNodes)[node] != 0;
     };
     if (nNodes == 0u || nLayers == 0u) return std::string();
-    const unsigned base = nLayers >= nNodes ? 1u : 0u;
-    unsigned left = nLayers;
-    for (unsigned i = 0; i < nNodes && left > 0u; ++i) {
-        if (!isLive(i)) continue;
-        const unsigned give = std::min(base, left);
-        layers[i] = give;
-        left -= give;
-    }
-    std::vector<unsigned> order;
-    order.reserve(nNodes);
+
+    std::vector<unsigned> pool;
+    pool.reserve(nNodes);
     for (unsigned i = 0; i < nNodes; ++i) {
-        if (isLive(i)) order.push_back(i);
+        if (isLive(i)) pool.push_back(i);
     }
-    std::stable_sort(order.begin(), order.end(), [&](unsigned a, unsigned b) {
-        if (profiles[a].msPerLayer != profiles[b].msPerLayer)
-            return profiles[a].msPerLayer < profiles[b].msPerLayer;
-        return a < b;
-    });
-    for (unsigned index : order) {
+    if (pool.empty()) return std::string();
+
+    // Every stage needs at least one layer or the chain breaks.
+    unsigned left = nLayers;
+    for (unsigned i : pool) {
         if (left == 0u) break;
-        const unsigned room = profiles[index].cap > layers[index] ? profiles[index].cap - layers[index] : 0u;
-        const unsigned take = std::min(room, left);
-        layers[index] += take;
-        left -= take;
+        layers[i] = 1u;
+        left -= 1u;
     }
-    if (left > 0u && !order.empty()) layers[order[0]] += left;
+
+    // Repeatedly split the remainder proportionally; pin and drop any device
+    // whose proportional share no longer fits under its cap.
+    while (left > 0u && !pool.empty()) {
+        double sumInv = 0.0;
+        for (unsigned i : pool) {
+            const double ms = profiles[i].msPerLayer > 0.0 ? profiles[i].msPerLayer : 1.0;
+            sumInv += 1.0 / ms;
+        }
+        if (sumInv <= 0.0) break;
+
+        unsigned assigned = 0u;
+        std::vector<unsigned> next;
+        next.reserve(pool.size());
+        for (unsigned i : pool) {
+            const double ms = profiles[i].msPerLayer > 0.0 ? profiles[i].msPerLayer : 1.0;
+            const double share = ((1.0 / ms) / sumInv) * (double)left;
+            unsigned give = (unsigned)(share + 0.5);
+            if (give == 0u) give = 1u;
+            const unsigned room = profiles[i].cap > layers[i] ? profiles[i].cap - layers[i] : 0u;
+            const unsigned take = std::min(give, room);
+            layers[i] += take;
+            assigned += take;
+            // Under the cap and still had room: eligible for another round.
+            if (layers[i] < profiles[i].cap) next.push_back(i);
+        }
+        if (assigned == 0u) break;
+        left = left >= assigned ? left - assigned : 0u;
+        if (left == 0u) break;
+        if (next.size() == pool.size()) {
+            // Nothing got pinned, so the split is already balanced; hand the
+            // rounding remainder to the device with the smallest stage time.
+            unsigned best = next[0];
+            for (unsigned i : next) {
+                const double ti = (double)(layers[i] + 1u) * profiles[i].msPerLayer;
+                const double tb = (double)(layers[best] + 1u) * profiles[best].msPerLayer;
+                if (ti < tb) best = i;
+            }
+            const unsigned room = profiles[best].cap > layers[best]
+                ? profiles[best].cap - layers[best] : 0u;
+            if (room == 0u) break;
+            layers[best] += 1u;
+            left -= 1u;
+        }
+        pool.swap(next);
+    }
+
+    // Unplaceable surplus. This should be rare: it only happens when every
+    // device is at its cap and layers remain, which means the model does not
+    // fit. Put the overflow on the slowest device and let the existing
+    // allocation-failure path shrink it, rather than silently exceeding a cap
+    // that was derived from free memory.
+    if (left > 0u) {
+        unsigned slowest = 0u;
+        for (unsigned i = 0; i < nNodes; ++i) {
+            if (isLive(i) && profiles[i].msPerLayer > profiles[slowest].msPerLayer) slowest = i;
+        }
+        layers[slowest] += left;
+    }
+
     std::ostringstream out;
     for (unsigned i = 0; i < nNodes; ++i) {
         if (i > 0u) out << '*';
