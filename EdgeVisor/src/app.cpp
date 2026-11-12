@@ -5664,22 +5664,26 @@ void RootLlmInference::forward(bool collectProfile) {
                 }
                 takeoverRejected = false;
                 const bool switched = sendPendingLayerSwitchControlOnly();
-                // Give the receiver a moment to answer before concluding it
-                // accepted. The refusal is a small frame sent as soon as the
-                // switch packet is parsed.
+                // The receiver answers only if it must refuse, so waiting for a
+                // refusal means polling for a short grace period: silence is
+                // acceptance. Drain whatever the socket has before concluding,
+                // otherwise a refusal that lands a millisecond later would be
+                // read as a successful takeover.
                 const int targetSocket = (network != nullptr)
                     ? network->getSocketIndexForNode(nextStageRootNode, 0u) : -1;
                 if (switched && targetSocket >= 0) {
+                    const int graceMs = 200;
                     const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(kvAckWaitTimeoutMs());
-                    while (!takeoverRejected &&
-                           std::chrono::steady_clock::now() < deadline) {
+                        std::chrono::milliseconds(graceMs);
+                    while (std::chrono::steady_clock::now() < deadline) {
                         LlmWorkerFrameHeader peek{};
-                        if (!network->tryPeekWithMaxAttempts((NnUint)targetSocket, &peek,
+                        if (network->tryPeekWithMaxAttempts((NnUint)targetSocket, &peek,
                                                              sizeof(peek), 1ul)) {
-                            break;
+                            pumpWorkerFrames((NnUint)targetSocket, graceMs);
+                            if (takeoverRejected) break;
+                            continue;
                         }
-                        pumpWorkerFrames((NnUint)targetSocket, 50);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     }
                 }
                 servedFromReservation = switched && !takeoverRejected;
