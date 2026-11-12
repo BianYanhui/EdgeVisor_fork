@@ -5630,7 +5630,27 @@ void RootLlmInference::forward(bool collectProfile) {
 
         if (ablationCfg.shadowKvMode == ShadowKvMode::ENABLED) {
             auto t0 = std::chrono::steady_clock::now();
-            if (migrateToLaterStage) {
+            // A forward move (stage i -> i+1) can be served from the reservation
+            // too: the receiving stage already holds copies of the sending
+            // stage's boundary layers, and the bubble pass keeps them current.
+            // Whether it can is a question for the reservation, not for the
+            // direction, so ask it first and fall back to a real transfer only
+            // when the copies are not there.
+            bool servedFromReservation = false;
+            if (migrateToLaterStage && !migrationLayers.empty()) {
+                const NnUint firstLayer = *std::min_element(migrationLayers.begin(), migrationLayers.end());
+                const NnUint lastLayer = *std::max_element(migrationLayers.begin(), migrationLayers.end());
+                servedFromReservation =
+                    executor != nullptr &&
+                    executor->shadowCovers(firstLayer, lastLayer + 1u, endPos);
+                if (!servedFromReservation) {
+                    std::printf("🧩 [kv-migrate] forward route has no reservation for layers=[%u,%u] "
+                                "at pos=%u; falling back to a full transfer\n",
+                        (unsigned)firstLayer, (unsigned)lastLayer + 1u, (unsigned)endPos);
+                    std::fflush(stdout);
+                }
+            }
+            if (migrateToLaterStage && !servedFromReservation) {
                 NnUint exported = 0u;
                 NnUint queued = 0u;
                 uint64_t sourceBytes = 0u;
@@ -5676,6 +5696,12 @@ void RootLlmInference::forward(bool collectProfile) {
                 auto t1 = std::chrono::steady_clock::now();
                 recoverMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
                 fallbackReason = "shadow_kv_precomputed_redundant_state";
+                if (migrateToLaterStage) {
+                    std::printf("🧩 [kv-migrate] forward route served from reservation "
+                                "layers=%zu posRange=[0,%u] status=%s\n",
+                        migrationLayers.size(), (unsigned)endPos, applyOk ? "ok" : "fail");
+                    std::fflush(stdout);
+                }
             }
             migrationBatchSubmitted = applyOk;
         } else if (ablationCfg.shadowKvMode == ShadowKvMode::DISABLED_TRANSFER) {
