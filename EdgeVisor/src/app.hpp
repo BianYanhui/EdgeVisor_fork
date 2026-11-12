@@ -384,7 +384,27 @@ enum LlmWorkerFrameKind : NnUint {
     LLM_WORKER_FRAME_PROFILE = 1u,
     LLM_WORKER_FRAME_SAMPLED_TOKEN = 2u,
     LLM_WORKER_FRAME_STAGE_BYPASS_ACK = 3u,
+    // Reply to a layer switch the receiving stage cannot honour because it does
+    // not hold a current shadow copy of the layers being handed over.
+    LLM_WORKER_FRAME_TAKEOVER_REJECT = 4u,
 };
+
+// A receiving stage answers a layer switch with this when its reservation does
+// not cover the range yet. The root then falls back to moving the KV instead.
+// The check belongs on the worker because that is where shadowFilledThrough_
+// lives; the root cannot see it, and asking would cost a round trip anyway.
+typedef struct {
+    NnUint magic;
+    NnUint version;
+    NnUint nodeIndex;
+    NnUint fromNodeIndex;
+    NnUint firstLayer;
+    NnUint endLayer;
+    NnUint position;
+    NnUint filledThrough;
+} LlmTakeoverRejectPacket;
+static constexpr NnUint LLM_TAKEOVER_REJECT_MAGIC = 0x52544b54u; // 'TKTR'
+static constexpr NnUint LLM_TAKEOVER_REJECT_VERSION = 1u;
 typedef struct {
     NnUint magic;
     NnUint version;
@@ -664,6 +684,12 @@ private:
     bool migrationAckSeen = false;
     int migrationAckPos = -1;
     int migrationAckLayer = -1;
+    // Set when a receiving stage refuses a layer switch because its shadow copy
+    // of those layers is not current. The root then moves the KV instead.
+    bool takeoverRejected = false;
+    NnUint takeoverRejectNode = 0u;
+    NnUint takeoverRejectLayer = 0u;
+    NnUint takeoverRejectPos = 0u;
     unsigned long long ppMigrationAppliedGeneration = 0ull;
     NnUint ppMigrationAppliedFromNodeIndex = 0u;
     NnUint ppMigrationAppliedToNodeIndex = (NnUint)-1;

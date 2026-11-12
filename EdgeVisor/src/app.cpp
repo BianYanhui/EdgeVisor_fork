@@ -4469,6 +4469,25 @@ void RootLlmInference::pumpWorkerFrames(NnUint socketIndex, int timeoutMs) {
             throw NnPeerTimeoutException(network->getPeerNodeIndex(socketIndex), "Timeout reading worker frame payload");
         if (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK) {
             consumeStageBypassAckFrame(socketIndex, payload);
+        } else if (frame.kind == LLM_WORKER_FRAME_TAKEOVER_REJECT &&
+                   payload.size() == sizeof(LlmTakeoverRejectPacket)) {
+            LlmTakeoverRejectPacket reject{};
+            std::memcpy(&reject, payload.data(), sizeof(reject));
+            if (reject.magic == LLM_TAKEOVER_REJECT_MAGIC &&
+                reject.version == LLM_TAKEOVER_REJECT_VERSION) {
+                // The receiving stage could not honour a switch because its
+                // reservation did not cover the range. Remember it so the
+                // caller can fall back to moving the KV instead of assuming
+                // the switch happened.
+                takeoverRejected = true;
+                takeoverRejectNode = reject.nodeIndex;
+                takeoverRejectLayer = reject.firstLayer;
+                takeoverRejectPos = reject.position;
+                std::printf("🔁 [takeover-reject] node=%u layer=%u pos=%u\n",
+                    (unsigned)reject.nodeIndex, (unsigned)reject.firstLayer,
+                    (unsigned)reject.position);
+                std::fflush(stdout);
+            }
         } else if (frame.kind == LLM_WORKER_FRAME_PROFILE && payload.size() == sizeof(LlmPerfPacket)) {
             LlmPerfPacket packet{}; std::memcpy(&packet, payload.data(), sizeof(packet));
             workerProfileFrameCache[socketIndex].push_back(packet);
@@ -5631,22 +5650,52 @@ void RootLlmInference::forward(bool collectProfile) {
         if (ablationCfg.shadowKvMode == ShadowKvMode::ENABLED) {
             auto t0 = std::chrono::steady_clock::now();
             // A forward move (stage i -> i+1) can be served from the reservation
-            // too: the receiving stage already holds copies of the sending
-            // stage's boundary layers, and the bubble pass keeps them current.
-            // Whether it can is a question for the reservation, not for the
-            // direction, so ask it first and fall back to a real transfer only
-            // when the copies are not there.
+            // too: the receiving stage holds copies of the sending stage's
+            // boundary layers. Whether it actually can depends on whether its
+            // bubble pass has filled them up to this position, and only the
+            // receiving stage knows that -- the root's executor tracks its own
+            // reservation, not the neighbour's. So try the switch first and let
+            // the receiver answer; a refusal means the KV has to travel.
             bool servedFromReservation = false;
-            if (migrateToLaterStage && !migrationLayers.empty()) {
-                const NnUint firstLayer = *std::min_element(migrationLayers.begin(), migrationLayers.end());
-                const NnUint lastLayer = *std::max_element(migrationLayers.begin(), migrationLayers.end());
-                servedFromReservation =
-                    executor != nullptr &&
-                    executor->shadowCovers(firstLayer, lastLayer + 1u, endPos);
-                if (!servedFromReservation) {
-                    std::printf("🧩 [kv-migrate] forward route has no reservation for layers=[%u,%u] "
-                                "at pos=%u; falling back to a full transfer\n",
-                        (unsigned)firstLayer, (unsigned)lastLayer + 1u, (unsigned)endPos);
+            if (migrateToLaterStage) {
+                {
+                    std::lock_guard<std::mutex> lk(kvTransferMutex);
+                    pendingLayerSwitchLayers = migrationLayers;
+                }
+                takeoverRejected = false;
+                const bool switched = sendPendingLayerSwitchControlOnly();
+                // Give the receiver a moment to answer before concluding it
+                // accepted. The refusal is a small frame sent as soon as the
+                // switch packet is parsed.
+                const int targetSocket = (network != nullptr)
+                    ? network->getSocketIndexForNode(nextStageRootNode, 0u) : -1;
+                if (switched && targetSocket >= 0) {
+                    const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(kvAckWaitTimeoutMs());
+                    while (!takeoverRejected &&
+                           std::chrono::steady_clock::now() < deadline) {
+                        LlmWorkerFrameHeader peek{};
+                        if (!network->tryPeekWithMaxAttempts((NnUint)targetSocket, &peek,
+                                                             sizeof(peek), 1ul)) {
+                            break;
+                        }
+                        pumpWorkerFrames((NnUint)targetSocket, 50);
+                    }
+                }
+                servedFromReservation = switched && !takeoverRejected;
+                if (servedFromReservation) {
+                    applyOk = true;
+                    auto t1 = std::chrono::steady_clock::now();
+                    recoverMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    fallbackReason = "shadow_kv_precomputed_redundant_state";
+                    std::printf("🧩 [kv-migrate] forward route served from reservation "
+                                "layers=%zu posRange=[0,%u] status=ok\n",
+                        migrationLayers.size(), (unsigned)endPos);
+                    std::fflush(stdout);
+                } else {
+                    std::printf("🧩 [kv-migrate] forward route reservation refused "
+                                "layer=%u pos=%u; falling back to a full transfer\n",
+                        (unsigned)takeoverRejectLayer, (unsigned)takeoverRejectPos);
                     std::fflush(stdout);
                 }
             }
@@ -5688,20 +5737,15 @@ void RootLlmInference::forward(bool collectProfile) {
                     (unsigned)nextStageRootNode,
                     applyOk ? "ok" : "fail");
             } else {
-                {
+                // Backward move (or a forward one already served above).
+                if (!applyOk) {
                     std::lock_guard<std::mutex> lk(kvTransferMutex);
                     pendingLayerSwitchLayers = migrationLayers;
                 }
-                applyOk = sendPendingLayerSwitchControlOnly();
+                if (!applyOk) applyOk = sendPendingLayerSwitchControlOnly();
                 auto t1 = std::chrono::steady_clock::now();
                 recoverMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
                 fallbackReason = "shadow_kv_precomputed_redundant_state";
-                if (migrateToLaterStage) {
-                    std::printf("🧩 [kv-migrate] forward route served from reservation "
-                                "layers=%zu posRange=[0,%u] status=%s\n",
-                        migrationLayers.size(), (unsigned)endPos, applyOk ? "ok" : "fail");
-                    std::fflush(stdout);
-                }
             }
             migrationBatchSubmitted = applyOk;
         } else if (ablationCfg.shadowKvMode == ShadowKvMode::DISABLED_TRANSFER) {
@@ -7880,6 +7924,35 @@ void runWorkerApp(AppCliArgs *args) {
                         std::fflush(stdout);
                     }
                     if (localIsTargetStage) {
+                        // Before taking the layer over, confirm this stage really
+                        // holds a current copy of its KV. A forward move reaches a
+                        // stage that never owned the layer, so its only chance is
+                        // the reservation; if the shadow pass has not filled it
+                        // up to this position, promoting the segment would hand
+                        // the pipeline empty history. Say so instead of switching,
+                        // and let the root move the KV.
+                        const NnUint takeoverPos = inference.position();
+                        if (!executor.shadowCovers(switchPkt.boundaryLayer,
+                                                   switchPkt.boundaryLayer + 1u, takeoverPos)) {
+                            LlmTakeoverRejectPacket reject{};
+                            reject.magic = LLM_TAKEOVER_REJECT_MAGIC;
+                            reject.version = LLM_TAKEOVER_REJECT_VERSION;
+                            reject.nodeIndex = nodeConfig.nodeIndex;
+                            reject.fromNodeIndex = switchPkt.fromNodeIndex;
+                            reject.firstLayer = switchPkt.boundaryLayer;
+                            reject.endLayer = switchPkt.boundaryLayer + 1u;
+                            reject.position = takeoverPos;
+                            reject.filledThrough = 0xFFFFFFFFu;
+                            writeWorkerFrame(network, LLM_WORKER_FRAME_TAKEOVER_REJECT,
+                                             &reject, sizeof(reject));
+                            std::printf("🔁 [worker-switch] node=%u reject layer=%u pos=%u "
+                                        "reason=shadow_not_covered\n",
+                                (unsigned)nodeConfig.nodeIndex,
+                                (unsigned)switchPkt.boundaryLayer,
+                                (unsigned)takeoverPos);
+                            std::fflush(stdout);
+                            continue;
+                        }
                         executor.setPrimaryLayerEnabled(switchPkt.boundaryLayer, true);
                         // The target holds the incoming layer as a redundant segment
                         // -- there is no primary segment for a layer this stage never
