@@ -6969,6 +6969,29 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     // IMPORTANT: plan barrier affects graph construction (insertion of OP_PLAN_BARRIER/OP_PLAN_APPLY)
     // so we must enable it before building the LLM net.
     setEnablePlanBarrier(args->enablePlanBarrier);
+    // Test hooks for the placement study: pretend a device has less free memory
+    // than it does, and/or spend a different share of it. Edge nodes are memory
+    // bound in ways this lab box is not, and varying the cap directly is the
+    // only way to observe how the shadow budget responds without changing model
+    // or context length.
+    if (const char *memOverride = std::getenv("EDGEVISOR_FREE_BYTES_OVERRIDE")) {
+        if (memOverride[0] != '\0') {
+            const unsigned long long bytes =
+                (unsigned long long)std::strtoull(memOverride, nullptr, 10);
+            freeBytesOverride() = bytes;
+            std::printf("📀 [placement] free-bytes override = %llu MiB\n",
+                (unsigned long long)(bytes / (1024ull * 1024ull)));
+        }
+    }
+    if (const char *fracOverride = std::getenv("EDGEVISOR_MEMORY_BUDGET_FRACTION")) {
+        if (fracOverride[0] != '\0') {
+            const double value = std::strtod(fracOverride, nullptr);
+            if (value > 0.0 && value <= 1.0) {
+                memoryBudgetFraction() = value;
+                std::printf("📀 [placement] memory budget fraction = %.2f\n", value);
+            }
+        }
+    }
     // IMPORTANT: stage full weights affects weight loading and buffer allocation
     // so we must enable it before building the LLM net.
     setEnableStageFullWeights(args->enableStageFullWeights);
