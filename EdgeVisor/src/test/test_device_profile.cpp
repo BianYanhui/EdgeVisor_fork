@@ -136,6 +136,58 @@ int main() {
         && overlaps[1].leftHolds == 1u && overlaps[1].rightHolds == 3u,
         "a middle stage splits its spare across both boundaries");
 
+    std::vector<unsigned> balancedPrimary(4u, 7u);
+    std::vector<double> balancedMs(4u, 5.0);
+    const std::vector<unsigned> balancedBubble = bubbleShadowLayerCap(balancedPrimary, balancedMs);
+    expect(balancedBubble.size() == 4u
+        && balancedBubble[0] == 21u && balancedBubble[1] == 21u
+        && balancedBubble[2] == 21u && balancedBubble[3] == 21u,
+        "a balanced pipeline leaves each device the other three stages of slack");
+
+    std::vector<unsigned> skewedPrimary;
+    std::vector<double> skewedMs;
+    skewedPrimary.push_back(2u);
+    skewedPrimary.push_back(20u);
+    skewedMs.push_back(10.0);
+    skewedMs.push_back(1.0);
+    const std::vector<unsigned> skewedBubble = bubbleShadowLayerCap(skewedPrimary, skewedMs);
+    expect(skewedBubble.size() == 2u && skewedBubble[0] == 2u && skewedBubble[1] == 20u,
+        "bubble depth is the other stages' time divided by this device's layer time");
+
+    std::vector<double> unknownMs;
+    unknownMs.push_back(0.0);
+    unknownMs.push_back(5.0);
+    const std::vector<unsigned> unknownBubble = bubbleShadowLayerCap(skewedPrimary, unknownMs);
+    expect(unknownBubble.size() == 2u
+        && unknownBubble[0] == 0xffffffffu && unknownBubble[1] == 0xffffffffu,
+        "a missed probe leaves the bubble uncapped");
+
+    std::vector<unsigned> bottleneckPrimary;
+    std::vector<double> bottleneckMs;
+    bottleneckPrimary.push_back(10u);
+    bottleneckPrimary.push_back(1u);
+    bottleneckMs.push_back(10.0);
+    bottleneckMs.push_back(1.0);
+    const std::vector<unsigned> bottleneckBubble = bubbleShadowLayerCap(bottleneckPrimary, bottleneckMs);
+    expect(bottleneckBubble.size() == 2u && bottleneckBubble[0] == 0u && bottleneckBubble[1] == 100u,
+        "a stage that already fills the token has no bubble left for shadow");
+
+    std::vector<unsigned> tightBubble;
+    tightBubble.push_back(2u);
+    tightBubble.push_back(100u);
+    primary.clear();
+    memoryCap.clear();
+    primary.push_back(22u);
+    primary.push_back(6u);
+    memoryCap.push_back(28u);
+    memoryCap.push_back(28u);
+    overlaps = assignBoundaryOverlap(primary, memoryCap, &tightBubble);
+    expect(overlaps.size() == 1u && overlaps[0].leftHolds == 2u && overlaps[0].rightHolds == 21u,
+        "bubble depth cuts a side that memory would still have filled");
+    overlaps = assignBoundaryOverlap(primary, memoryCap);
+    expect(overlaps.size() == 1u && overlaps[0].leftHolds == 5u && overlaps[0].rightHolds == 21u,
+        "without a bubble cap the memory spare is unchanged");
+
     ModelShape residentShape;
     residentShape.dim = 5120u;
     residentShape.hiddenDim = 17408u;

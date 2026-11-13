@@ -6542,6 +6542,21 @@ static unsigned memoryLayerCap(const char *host, int port, const ModelShape &sha
     return resident;
 }
 
+static SpeedDeviceProfile profileForHost(const char *host, int port, bool live, const ModelShape *shape);
+static SpeedDeviceProfile profileForLocal(const ModelShape *shape);
+
+// Prefer the speed-pack probe. Explicit ratios never ran that pass, so measure
+// the device once here; the same call fills the memory-cap cache.
+static double nodeLayerMs(const char *host, int port, const ModelShape *shape) {
+    const std::string key = host == nullptr ? std::string("local") : std::string(host);
+    SpeedDeviceProfile cached;
+    if (cachedSpeedProfile(key, &cached) && cached.msPerLayer > 0.0) return cached.msPerLayer;
+    const SpeedDeviceProfile profile = host == nullptr
+        ? profileForLocal(shape)
+        : profileForHost(host, port, true, shape);
+    return profile.msPerLayer;
+}
+
 static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionPlan *plan, const LlmHeader &header) {
     g_autoBoundaryDepths.clear();
     if (args != nullptr) args->boundaryDepthsStr = nullptr;
@@ -6561,9 +6576,11 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     const ModelShape shape = modelShapeFromHeader(header);
     std::vector<unsigned> primary(plan->nStages, 0u);
     std::vector<unsigned> caps(plan->nStages, 0u);
+    std::vector<double> layerMs(plan->nStages, 0.0);
     for (NnUint s = 0u; s < plan->nStages; ++s) {
         primary[s] = plan->stages[s].nLayers;
         unsigned cap = 0xffffffffu;
+        double slowestMs = 0.0;
         bool any = false;
         const NnUint nStageNodes = plan->stages[s].nNodes;
         for (NnUint n = 0u; n < nStageNodes; ++n) {
@@ -6574,14 +6591,18 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
                 host = args->workerHosts[node - 1u];
                 port = (int)args->workerPorts[node - 1u];
             }
+            const double ms = nodeLayerMs(host, port, &shape);
+            if (ms > slowestMs) slowestMs = ms;
             const unsigned nodeCap = memoryLayerCap(host, port, shape);
             if (!any || nodeCap < cap) cap = nodeCap;
             any = true;
         }
         caps[s] = any ? cap : 0u;
+        layerMs[s] = slowestMs;
     }
 
-    const std::vector<BoundaryOverlap> overlaps = assignBoundaryOverlap(primary, caps);
+    const std::vector<unsigned> bubbleCap = bubbleShadowLayerCap(primary, layerMs);
+    const std::vector<BoundaryOverlap> overlaps = assignBoundaryOverlap(primary, caps, &bubbleCap);
     g_autoBoundaryDepths = formatBoundaryOverlap(overlaps);
     if (g_autoBoundaryDepths.empty()) {
         unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
@@ -6593,6 +6614,17 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     for (size_t i = 0u; i < overlaps.size(); ++i) {
         std::printf(" %u->%u %u,%u", (unsigned)i, (unsigned)(i + 1u),
             overlaps[i].leftHolds, overlaps[i].rightHolds);
+    }
+    std::printf("\nshadow-cap:");
+    for (NnUint s = 0u; s < plan->nStages; ++s) {
+        const unsigned memSpare = caps[s] > primary[s] ? caps[s] - primary[s] : 0u;
+        const unsigned bubble = s < bubbleCap.size() ? bubbleCap[s] : 0xffffffffu;
+        const unsigned use = std::min(memSpare, bubble);
+        if (bubble == 0xffffffffu) {
+            std::printf(" %u mem=%u bubble=unk use=%u", (unsigned)s, memSpare, use);
+        } else {
+            std::printf(" %u mem=%u bubble=%u use=%u", (unsigned)s, memSpare, bubble, use);
+        }
     }
     std::printf("\n");
     std::fflush(stdout);

@@ -365,18 +365,64 @@ struct BoundaryOverlap {
     unsigned rightHolds = 0u;
 };
 
-// After the primary split, each stage may keep extra layers in the memory
-// cap that estimateLayerCap already computed (70% of free memory, one layer
-// of headroom). A stage with two neighbors spends that spare on both
-// boundaries. A stage is never emptied, so a neighbor with N primary layers
-// can donate at most N-1.
+// How many extra layers fit in each device's pipeline bubble.
+//
+// A single-batch token walks the stages one after another, so device i is
+// free for the whole time the other stages are computing. The startup probe
+// already measured that compute as msPerLayer, and the primary split says how
+// many layers each stage owns. idle_i / ms_i is therefore the shadow depth
+// that finishes before the token moves on. A shadow pass skips the peer sync,
+// so charging the full layer time is a little tighter than the real bubble.
+// An unknown rate (ms <= 0) leaves the device uncapped rather than wiping its
+// shadow on a missed probe.
+inline std::vector<unsigned> bubbleShadowLayerCap(
+    const std::vector<unsigned> &primary,
+    const std::vector<double> &msPerLayer) {
+    const unsigned n = (unsigned)std::min(primary.size(), msPerLayer.size());
+    std::vector<unsigned> cap(primary.size(), 0xffffffffu);
+    for (unsigned i = 0; i < n; ++i) {
+        if (!(msPerLayer[i] > 0.0)) continue;
+        double otherMs = 0.0;
+        bool blocked = false;
+        for (unsigned j = 0; j < n; ++j) {
+            if (j == i || primary[j] == 0u) continue;
+            if (!(msPerLayer[j] > 0.0)) {
+                blocked = true;
+                break;
+            }
+            otherMs += (double)primary[j] * msPerLayer[j];
+        }
+        if (blocked) continue;
+        const double layers = otherMs / msPerLayer[i];
+        if (!(layers > 0.0)) {
+            cap[i] = 0u;
+        } else if (layers >= (double)0xffffffffu) {
+            cap[i] = 0xffffffffu;
+        } else {
+            cap[i] = (unsigned)(layers + 1e-9);
+        }
+    }
+    return cap;
+}
+
+// After the primary split, each stage may keep extra layers up to the tighter
+// of two caps: leftover memory (70% of free memory, one layer of headroom)
+// and the bubble depth from bubbleShadowLayerCap. A null bubble cap means
+// "memory only", which is what the older callers asked for. A stage with two
+// neighbors spends that spare on both boundaries. A stage is never emptied,
+// so a neighbor with N primary layers can donate at most N-1.
 inline std::vector<BoundaryOverlap> assignBoundaryOverlap(
     const std::vector<unsigned> &primary,
-    const std::vector<unsigned> &memoryCap) {
+    const std::vector<unsigned> &memoryCap,
+    const std::vector<unsigned> *bubbleCap = nullptr) {
     const unsigned n = (unsigned)std::min(primary.size(), memoryCap.size());
     std::vector<unsigned> spare(n, 0u);
     for (unsigned i = 0; i < n; ++i) {
-        spare[i] = memoryCap[i] > primary[i] ? memoryCap[i] - primary[i] : 0u;
+        const unsigned memSpare = memoryCap[i] > primary[i] ? memoryCap[i] - primary[i] : 0u;
+        unsigned limit = memSpare;
+        if (bubbleCap != nullptr && i < bubbleCap->size())
+            limit = std::min(limit, (*bubbleCap)[i]);
+        spare[i] = limit;
     }
     std::vector<BoundaryOverlap> overlaps(n < 2u ? 0u : n - 1u);
     bool grew = true;
