@@ -323,6 +323,10 @@ enum LlmLayerSwitchFlags : NnUint {
     LLM_LAYER_SWITCH_STAGE_BYPASS = 1u << 0,
     LLM_LAYER_SWITCH_NEW_PP_START = 1u << 1,
     LLM_LAYER_SWITCH_RESTORE_PP_START = 1u << 2,
+    // The KV for these layers has already been moved by the sender.  The
+    // receiver must install the layer even when its own shadow pass has not
+    // covered the position, because refusing would strand the transfer.
+    LLM_LAYER_SWITCH_INSTALL = 1u << 3,
 };
 
 typedef struct {
@@ -735,7 +739,11 @@ private:
     bool flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes);
     void resetPendingKvMigrationState(const char *reason);
     bool verifyPendingLayerSwitchPrecommit();
-    bool sendPendingLayerSwitchControlOnly();
+    // installKv: the caller already moved the KV, so the receiver must install
+    // the layers unconditionally.  When false this is a reservation probe: a
+    // root-local target that has not covered the position refuses instead of
+    // taking a layer it cannot execute.
+    bool sendPendingLayerSwitchControlOnly(bool installKv);
     // Asks the receiving stage to upload weights for these layers and waits for
     // the upload to finish. No-op for arms that pre-reserved them at boot.
     bool sendWeightLoadRequest(const std::vector<NnUint> &layers);

@@ -4167,7 +4167,7 @@ bool RootLlmInference::sendWeightLoadRequest(const std::vector<NnUint> &layers) 
     return true;
 }
 
-bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
+bool RootLlmInference::sendPendingLayerSwitchControlOnly(bool installKv) {
     if (network == nullptr) return false;
     std::vector<NnUint> switchLayers;
     bool stageBypass = false;
@@ -4179,6 +4179,26 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
         std::lock_guard<std::mutex> lk(kvTransferMutex);
         if (pendingLayerSwitchLayers.empty()) return false;
         switchLayers = pendingLayerSwitchLayers;
+        // A reservation probe that the root itself must execute has to be
+        // answered here: no worker will get the chance to refuse it.  Check
+        // before the binding moves and before the layers are cleared so the
+        // caller can still fall back to a real transfer.
+        if (!installKv && executor != nullptr &&
+                areNodesInSameStageLocal(plan, 0u, nextStageRootNode)) {
+            for (NnUint layer : switchLayers) {
+                if (!executor->shadowCovers(layer, layer + 1u, controlPacket.position)) {
+                    takeoverRejected = true;
+                    takeoverRejectNode = 0u;
+                    takeoverRejectLayer = layer;
+                    takeoverRejectPos = controlPacket.position;
+                    std::printf("🔁 [takeover-reject] node=0 layer=%u pos=%u "
+                                "reason=root_shadow_not_covered\n",
+                        (unsigned)layer, (unsigned)controlPacket.position);
+                    std::fflush(stdout);
+                    return false;
+                }
+            }
+        }
         pendingLayerSwitchLayers.clear();
         stageBypass = pendingStageBypass;
         bypassEjectedStage = pendingBypassEjectedStage;
@@ -4261,6 +4281,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
         const bool carryStageBypass = stageBypass && !stageBypassFlagEmitted;
         switchPkt.reserved0 = carryStageBypass ? LLM_LAYER_SWITCH_STAGE_BYPASS : 0u;
         if (layer == ppStartBoundaryLayer) switchPkt.reserved0 |= ppStartFlag;
+        if (installKv) switchPkt.reserved0 |= LLM_LAYER_SWITCH_INSTALL;
         switchPkt.reserved1 = carryStageBypass ? bypassEjectedStage : 0u;
         switchPkt.reserved2 = carryStageBypass ? bypassTargetStage : 0u;
         stageBypassFlagEmitted = stageBypassFlagEmitted || carryStageBypass;
@@ -5379,7 +5400,7 @@ void RootLlmInference::forward(bool collectProfile) {
                         pendingBypassEjectedStage = ejectedStageIndex;
                         pendingBypassTargetStage = targetStageIndex;
                     }
-                    const bool switched = sendPendingLayerSwitchControlOnly();
+                    const bool switched = sendPendingLayerSwitchControlOnly(true);
                     lastPpPlanCacheSeqApplied = snap.cacheSeq;
                     if (switched) planCommandCache().consumeIfCacheSeq(snap.cacheSeq);
                     std::printf("🔁 [stage-bypass] apply ejectedStage=%u targetStage=%u layers=%zu status=%s\n",
@@ -5649,61 +5670,59 @@ void RootLlmInference::forward(bool collectProfile) {
 
         if (ablationCfg.shadowKvMode == ShadowKvMode::ENABLED) {
             auto t0 = std::chrono::steady_clock::now();
-            // A forward move (stage i -> i+1) can be served from the reservation
-            // too: the receiving stage holds copies of the sending stage's
-            // boundary layers. Whether it actually can depends on whether its
-            // bubble pass has filled them up to this position, and only the
-            // receiving stage knows that -- the root's executor tracks its own
-            // reservation, not the neighbour's. So try the switch first and let
-            // the receiver answer; a refusal means the KV has to travel.
-            bool servedFromReservation = false;
-            if (migrateToLaterStage) {
-                {
-                    std::lock_guard<std::mutex> lk(kvTransferMutex);
-                    pendingLayerSwitchLayers = migrationLayers;
-                }
-                takeoverRejected = false;
-                const bool switched = sendPendingLayerSwitchControlOnly();
+            {
+                std::lock_guard<std::mutex> lk(kvTransferMutex);
+                pendingLayerSwitchLayers = migrationLayers;
+            }
+            takeoverRejected = false;
+            // Both directions open with a reservation probe, not an install.
+            // Whether the takeover actually lands depends on whether the
+            // receiving stage's bubble pass has filled the layer up to this
+            // position.  A remote receiver answers a refusal; a root-local
+            // receiver is checked in-process before anything is written.
+            const bool switched = sendPendingLayerSwitchControlOnly(false);
+            const int targetSocket = (network != nullptr)
+                ? network->getSocketIndexForNode(nextStageRootNode, 0u) : -1;
+            if (switched && targetSocket >= 0 && nextStageRootNode != 0u) {
                 // The receiver answers only if it must refuse, so waiting for a
                 // refusal means polling for a short grace period: silence is
                 // acceptance. Drain whatever the socket has before concluding,
                 // otherwise a refusal that lands a millisecond later would be
                 // read as a successful takeover.
-                const int targetSocket = (network != nullptr)
-                    ? network->getSocketIndexForNode(nextStageRootNode, 0u) : -1;
-                if (switched && targetSocket >= 0) {
-                    const int graceMs = 200;
-                    const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(graceMs);
-                    while (std::chrono::steady_clock::now() < deadline) {
-                        LlmWorkerFrameHeader peek{};
-                        if (network->tryPeekWithMaxAttempts((NnUint)targetSocket, &peek,
-                                                             sizeof(peek), 1ul)) {
-                            pumpWorkerFrames((NnUint)targetSocket, graceMs);
-                            if (takeoverRejected) break;
-                            continue;
-                        }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                const int graceMs = 200;
+                const auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(graceMs);
+                while (std::chrono::steady_clock::now() < deadline) {
+                    LlmWorkerFrameHeader peek{};
+                    if (network->tryPeekWithMaxAttempts((NnUint)targetSocket, &peek,
+                                                         sizeof(peek), 1ul)) {
+                        pumpWorkerFrames((NnUint)targetSocket, graceMs);
+                        if (takeoverRejected) break;
+                        continue;
                     }
-                }
-                servedFromReservation = switched && !takeoverRejected;
-                if (servedFromReservation) {
-                    applyOk = true;
-                    auto t1 = std::chrono::steady_clock::now();
-                    recoverMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                    fallbackReason = "shadow_kv_precomputed_redundant_state";
-                    std::printf("🧩 [kv-migrate] forward route served from reservation "
-                                "layers=%zu posRange=[0,%u] status=ok\n",
-                        migrationLayers.size(), (unsigned)endPos);
-                    std::fflush(stdout);
-                } else {
-                    std::printf("🧩 [kv-migrate] forward route reservation refused "
-                                "layer=%u pos=%u; falling back to a full transfer\n",
-                        (unsigned)takeoverRejectLayer, (unsigned)takeoverRejectPos);
-                    std::fflush(stdout);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
             }
-            if (migrateToLaterStage && !servedFromReservation) {
+            const bool servedFromReservation = switched && !takeoverRejected;
+            if (servedFromReservation) {
+                applyOk = true;
+                auto t1 = std::chrono::steady_clock::now();
+                recoverMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                fallbackReason = "shadow_kv_precomputed_redundant_state";
+                std::printf("🧩 [kv-migrate] %s route served from reservation "
+                            "layers=%zu posRange=[0,%u] status=ok\n",
+                    migrateToLaterStage ? "forward" : "backward",
+                    migrationLayers.size(), (unsigned)endPos);
+                std::fflush(stdout);
+            } else {
+                std::printf("🧩 [kv-migrate] %s route reservation refused "
+                            "layer=%u pos=%u; falling back to a full transfer\n",
+                    migrateToLaterStage ? "forward" : "backward",
+                    (unsigned)takeoverRejectLayer, (unsigned)takeoverRejectPos);
+                std::fflush(stdout);
+                // The probe did not take: the KV has to travel for real, and the
+                // switch that follows carries the install flag so the receiver
+                // stops re-checking a reservation it just proved it lacks.
                 NnUint exported = 0u;
                 NnUint queued = 0u;
                 uint64_t sourceBytes = 0u;
@@ -5713,25 +5732,45 @@ void RootLlmInference::forward(bool collectProfile) {
                 if (!weightResidencyPreallocated) {
                     sendWeightLoadRequest(migrationLayers);
                 }
+                // The copy starts at position 0 even when the shadow is only a
+                // few tokens short of endPos. Patching just that tail is
+                // deferred: the bubble pass is run to completion after every
+                // token, so a prepared layer is normally current and a miss is
+                // a layer that was never reserved. Splicing a gap onto a live
+                // prefix has to avoid double-counting the residual, which is a
+                // larger change than this fallback.
                 const bool collected = collectSourceStageKvTransfers(endPos, &exported, &queued, &sourceBytes);
                 auto t1 = std::chrono::steady_clock::now();
                 uint64_t targetBytes = 0u;
-                const bool transferred = collected && flushPendingKvTransfersControlOnly(&targetBytes);
+                // A root-local target had its rows applied straight into the
+                // local cache by submitBoundaryKvTransfer, so there is nothing
+                // queued to flush -- and flushing an empty queue would report
+                // failure and abort the install.
+                const bool localTarget = (nextStageRootNode == 0u);
+                const bool transferred = collected && (localTarget || flushPendingKvTransfersControlOnly(&targetBytes));
                 if (transferred) {
                     e5PhaseHook("install", endPos, migrationFromNodeIndex, nextStageRootNode,
                         migrationLayers.empty() ? 0xFFFFFFFFu : migrationLayers.back());
                 }
                 const bool precommitReady = transferred && verifyPendingLayerSwitchPrecommit();
-                const bool switched = precommitReady && sendPendingLayerSwitchControlOnly();
+                if (precommitReady) {
+                    // The reservation probe consumed pendingLayerSwitchLayers
+                    // when it was sent. The install switch needs them back or it
+                    // has nothing to write.
+                    std::lock_guard<std::mutex> lk(kvTransferMutex);
+                    pendingLayerSwitchLayers = migrationLayers;
+                }
+                const bool reinstalled = precommitReady && sendPendingLayerSwitchControlOnly(true);
                 auto t2 = std::chrono::steady_clock::now();
                 statePrepareMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
                 recoverMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
                 stateBytes = sourceBytes + targetBytes;
                 lastMigrationStateTransferBytes = stateBytes;
                 lastMigrationExportedRows = exported;
-                applyOk = switched;
-                fallbackReason = "shadow_kv_forward_real_transfer";
-                std::printf("🧩 [kv-migrate] shadow forward transfer exported=%u queued=%u layers=%u posRange=[0,%u] sourceBytes=%llu targetBytes=%llu targetRoot=%u status=%s\n",
+                applyOk = reinstalled;
+                fallbackReason = "shadow_kv_reservation_miss_transfer";
+                std::printf("🧩 [kv-migrate] shadow %s transfer exported=%u queued=%u layers=%u posRange=[0,%u] sourceBytes=%llu targetBytes=%llu targetRoot=%u status=%s\n",
+                    migrateToLaterStage ? "forward" : "backward",
                     (unsigned)exported,
                     (unsigned)queued,
                     (unsigned)migrationLayers.size(),
@@ -5740,16 +5779,7 @@ void RootLlmInference::forward(bool collectProfile) {
                     (unsigned long long)targetBytes,
                     (unsigned)nextStageRootNode,
                     applyOk ? "ok" : "fail");
-            } else {
-                // Backward move (or a forward one already served above).
-                if (!applyOk) {
-                    std::lock_guard<std::mutex> lk(kvTransferMutex);
-                    pendingLayerSwitchLayers = migrationLayers;
-                }
-                if (!applyOk) applyOk = sendPendingLayerSwitchControlOnly();
-                auto t1 = std::chrono::steady_clock::now();
-                recoverMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                fallbackReason = "shadow_kv_precomputed_redundant_state";
+                std::fflush(stdout);
             }
             migrationBatchSubmitted = applyOk;
         } else if (ablationCfg.shadowKvMode == ShadowKvMode::DISABLED_TRANSFER) {
@@ -5782,7 +5812,7 @@ void RootLlmInference::forward(bool collectProfile) {
                     migrationLayers.empty() ? 0xFFFFFFFFu : migrationLayers.back());
             }
             const bool precommitReady = transferred && verifyPendingLayerSwitchPrecommit();
-            const bool switched = precommitReady && sendPendingLayerSwitchControlOnly();
+            const bool switched = precommitReady && sendPendingLayerSwitchControlOnly(true);
             auto t2 = std::chrono::steady_clock::now();
             statePrepareMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
             recoverMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
@@ -5818,7 +5848,7 @@ void RootLlmInference::forward(bool collectProfile) {
             if (!weightResidencyPreallocated) {
                 sendWeightLoadRequest(migrationLayers);
             }
-            const bool switched = sendPendingLayerSwitchControlOnly();
+            const bool switched = sendPendingLayerSwitchControlOnly(true);
             auto tSwitch = std::chrono::steady_clock::now();
             double replayMs = 0.0;
             uint64_t replayUnits = 0u;
@@ -7936,8 +7966,14 @@ void runWorkerApp(AppCliArgs *args) {
                         // the pipeline empty history. Say so instead of switching,
                         // and let the root move the KV.
                         const NnUint takeoverPos = inference.position();
-                        if (!executor.shadowCovers(switchPkt.boundaryLayer,
-                                                   switchPkt.boundaryLayer + 1u, takeoverPos)) {
+                        // A packet that carries the install flag says the root
+                        // already moved the KV for this layer, so the shadow
+                        // check has nothing left to protect against: install it.
+                        const bool installKv =
+                            (switchPkt.reserved0 & LLM_LAYER_SWITCH_INSTALL) != 0u;
+                        if (!installKv &&
+                                !executor.shadowCovers(switchPkt.boundaryLayer,
+                                                       switchPkt.boundaryLayer + 1u, takeoverPos)) {
                             LlmTakeoverRejectPacket reject{};
                             reject.magic = LLM_TAKEOVER_REJECT_MAGIC;
                             reject.version = LLM_TAKEOVER_REJECT_VERSION;
