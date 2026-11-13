@@ -323,6 +323,10 @@ enum LlmLayerSwitchFlags : NnUint {
     LLM_LAYER_SWITCH_STAGE_BYPASS = 1u << 0,
     LLM_LAYER_SWITCH_NEW_PP_START = 1u << 1,
     LLM_LAYER_SWITCH_RESTORE_PP_START = 1u << 2,
+    // The KV for these layers has already been moved by the sender.  The
+    // receiver must install the layer even when its own shadow pass has not
+    // covered the position, because refusing would strand the transfer.
+    LLM_LAYER_SWITCH_INSTALL = 1u << 3,
 };
 
 typedef struct {
@@ -384,7 +388,27 @@ enum LlmWorkerFrameKind : NnUint {
     LLM_WORKER_FRAME_PROFILE = 1u,
     LLM_WORKER_FRAME_SAMPLED_TOKEN = 2u,
     LLM_WORKER_FRAME_STAGE_BYPASS_ACK = 3u,
+    // Reply to a layer switch the receiving stage cannot honour because it does
+    // not hold a current shadow copy of the layers being handed over.
+    LLM_WORKER_FRAME_TAKEOVER_REJECT = 4u,
 };
+
+// A receiving stage answers a layer switch with this when its reservation does
+// not cover the range yet. The root then falls back to moving the KV instead.
+// The check belongs on the worker because that is where shadowFilledThrough_
+// lives; the root cannot see it, and asking would cost a round trip anyway.
+typedef struct {
+    NnUint magic;
+    NnUint version;
+    NnUint nodeIndex;
+    NnUint fromNodeIndex;
+    NnUint firstLayer;
+    NnUint endLayer;
+    NnUint position;
+    NnUint filledThrough;
+} LlmTakeoverRejectPacket;
+static constexpr NnUint LLM_TAKEOVER_REJECT_MAGIC = 0x52544b54u; // 'TKTR'
+static constexpr NnUint LLM_TAKEOVER_REJECT_VERSION = 1u;
 typedef struct {
     NnUint magic;
     NnUint version;
@@ -664,6 +688,12 @@ private:
     bool migrationAckSeen = false;
     int migrationAckPos = -1;
     int migrationAckLayer = -1;
+    // Set when a receiving stage refuses a layer switch because its shadow copy
+    // of those layers is not current. The root then moves the KV instead.
+    bool takeoverRejected = false;
+    NnUint takeoverRejectNode = 0u;
+    NnUint takeoverRejectLayer = 0u;
+    NnUint takeoverRejectPos = 0u;
     unsigned long long ppMigrationAppliedGeneration = 0ull;
     NnUint ppMigrationAppliedFromNodeIndex = 0u;
     NnUint ppMigrationAppliedToNodeIndex = (NnUint)-1;
@@ -709,7 +739,11 @@ private:
     bool flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes);
     void resetPendingKvMigrationState(const char *reason);
     bool verifyPendingLayerSwitchPrecommit();
-    bool sendPendingLayerSwitchControlOnly();
+    // installKv: the caller already moved the KV, so the receiver must install
+    // the layers unconditionally.  When false this is a reservation probe: a
+    // root-local target that has not covered the position refuses instead of
+    // taking a layer it cannot execute.
+    bool sendPendingLayerSwitchControlOnly(bool installKv);
     // Asks the receiving stage to upload weights for these layers and waits for
     // the upload to finish. No-op for arms that pre-reserved them at boot.
     bool sendWeightLoadRequest(const std::vector<NnUint> &layers);
